@@ -1,200 +1,158 @@
 """
 Calculator agent — given player party + trainer party JSON, calculates the optimal
-no-item battle strategy for a Nuzlocke run.
+no-item Nuzlocke battle strategy.
 """
 
 import json
 import os
-import anthropic
+from google import genai
+from google.genai import types
 from src.tools.damage_calc import best_move_against, estimate_turns_to_ko, speed_order, type_weaknesses
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MODEL = "claude-sonnet-4-6"
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "gemini-2.0-flash"
 
-# ── Tool definitions ───────────────────────────────────────────────────────
-
-TOOLS = [
-    {
-        "name": "calc_damage",
-        "description": (
-            "Calculate min/max/average damage for each of the attacker's moves "
-            "against the defender. Returns moves sorted by average damage."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "attacker": {
-                    "type": "object",
-                    "description": "Attacker Pokémon dict with level, atk, spa, type1, type2, moves",
+TOOLS = [{
+    "function_declarations": [
+        {
+            "name": "calc_damage",
+            "description": "Calculate min/max/avg damage for each of the attacker's moves against the defender.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attacker": {"type": "object", "description": "Attacker dict: level, atk, spa, type1, type2, moves"},
+                    "defender": {"type": "object", "description": "Defender dict: current_hp, def, spd, type1, type2"},
                 },
-                "defender": {
-                    "type": "object",
-                    "description": "Defender Pokémon dict with current_hp, def, spd, type1, type2",
+                "required": ["attacker", "defender"],
+            },
+        },
+        {
+            "name": "calc_speed_order",
+            "description": "Determine which Pokémon attacks first.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pokemon_a": {"type": "object", "description": "Pokémon A with spe stat"},
+                    "pokemon_b": {"type": "object", "description": "Pokémon B with spe stat"},
                 },
+                "required": ["pokemon_a", "pokemon_b"],
             },
-            "required": ["attacker", "defender"],
         },
-    },
-    {
-        "name": "calc_speed_order",
-        "description": "Determine which Pokémon attacks first based on Speed stat.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "pokemon_a": {"type": "object", "description": "Pokémon A with spe stat"},
-                "pokemon_b": {"type": "object", "description": "Pokémon B with spe stat"},
+        {
+            "name": "calc_turns_to_ko",
+            "description": "Estimate turns each side needs to KO the other.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attacker": {"type": "object"},
+                    "defender": {"type": "object"},
+                },
+                "required": ["attacker", "defender"],
             },
-            "required": ["pokemon_a", "pokemon_b"],
         },
-    },
-    {
-        "name": "calc_turns_to_ko",
-        "description": "Estimate how many turns each side needs to KO the other.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "attacker": {"type": "object"},
-                "defender": {"type": "object"},
+        {
+            "name": "get_type_weaknesses",
+            "description": "Get all type effectiveness values for a Pokémon's type combo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "type1": {"type": "string"},
+                    "type2": {"type": "string"},
+                },
+                "required": ["type1"],
             },
-            "required": ["attacker", "defender"],
         },
-    },
-    {
-        "name": "get_type_weaknesses",
-        "description": "Get all type effectiveness values for a Pokémon's type combination.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "type1": {"type": "string"},
-                "type2": {"type": "string", "description": "Optional second type"},
-            },
-            "required": ["type1"],
-        },
-    },
-]
-
-
-def _run_tool(tool_name: str, tool_input: dict) -> str:
-    try:
-        if tool_name == "calc_damage":
-            result = best_move_against(tool_input["attacker"], tool_input["defender"])
-            return json.dumps({"success": True, "data": result})
-
-        elif tool_name == "calc_speed_order":
-            result = speed_order(tool_input["pokemon_a"], tool_input["pokemon_b"])
-            return json.dumps({"success": True, "data": {"goes_first": result}})
-
-        elif tool_name == "calc_turns_to_ko":
-            result = estimate_turns_to_ko(tool_input["attacker"], tool_input["defender"])
-            return json.dumps({"success": True, "data": result})
-
-        elif tool_name == "get_type_weaknesses":
-            result = type_weaknesses(tool_input["type1"], tool_input.get("type2"))
-            return json.dumps({"success": True, "data": result})
-
-    except Exception as e:
-        return json.dumps({"success": False, "error": str(e)})
-
-    return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
-
-
-# ── Agent loop ─────────────────────────────────────────────────────────────
+    ]
+}]
 
 SYSTEM_PROMPT = """You are the Calculator agent for a Pokémon Nuzlocke assistant.
-Your job is to produce the optimal battle strategy for the player to defeat the next trainer
-without losing any Pokémon (a Nuzlocke death is permanent).
+Produce the optimal battle strategy to defeat the next trainer without losing any Pokémon.
 
-Rules you MUST follow:
-1. Never recommend using items (Potions, X-items, etc.) — held items are fine.
-2. Prioritize Pokémon survival above all else, even if it makes the battle slower.
-3. Consider speed to know if the player moves first or gets hit first.
-4. Consider worst-case damage (minimum damage from player, maximum damage from opponent).
-5. Recommend switching out if a matchup is dangerous, even if it costs a turn.
-6. Account for fainting: if a Pokémon is already at low HP, factor that in.
+Rules:
+1. Never recommend items (Potions, X-items). Held items are fine.
+2. Prioritise Pokémon survival above all else.
+3. Use calc_speed_order to know who moves first.
+4. Use worst-case damage (min player damage, max opponent damage).
+5. Recommend switching if a matchup is dangerous.
+6. Account for low-HP Pokémon.
 
-Use the calc_damage, calc_speed_order, calc_turns_to_ko, and get_type_weaknesses tools
-to do the math before making any recommendation.
-
-Output a JSON strategy with this structure:
+Use the tools to run calculations, then output ONLY this JSON:
 {
   "lead_recommendation": "<species_name>",
-  "lead_reasoning": "<why this lead>",
+  "lead_reasoning": "<why>",
   "matchups": [
     {
       "player_pokemon": "<name>",
       "opponent_pokemon": "<name>",
       "recommended_move": "<move>",
       "risk_level": "safe|caution|dangerous",
-      "notes": "<e.g. switch out if below X HP>"
+      "notes": "<e.g. switch if below X HP>"
     }
   ],
   "overall_notes": "<general advice>",
-  "danger_pokemon": ["<names of opponent mons that pose highest risk>"]
+  "danger_pokemon": ["<names of highest-risk opponent mons>"]
 }"""
 
 
+def _run_tool(name: str, args: dict) -> str:
+    try:
+        if name == "calc_damage":
+            return json.dumps({"success": True, "data": best_move_against(args["attacker"], args["defender"])})
+        if name == "calc_speed_order":
+            return json.dumps({"success": True, "data": {"goes_first": speed_order(args["pokemon_a"], args["pokemon_b"])}})
+        if name == "calc_turns_to_ko":
+            return json.dumps({"success": True, "data": estimate_turns_to_ko(args["attacker"], args["defender"])})
+        if name == "get_type_weaknesses":
+            return json.dumps({"success": True, "data": type_weaknesses(args["type1"], args.get("type2"))})
+    except Exception as e:
+        return json.dumps({"success": False, "error": str(e)})
+    return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
+
+
 def calculate_strategy(player_party: list[dict], trainer_party: list[dict]) -> dict:
-    """
-    Returns: { success, data: strategy dict, summary: str }
-    """
-    context = json.dumps({
-        "player_party": player_party,
-        "opponent_party": trainer_party,
-    }, indent=2)
+    context = json.dumps({"player_party": player_party, "opponent_party": trainer_party}, indent=2)
 
-    messages = [
-        {
-            "role": "user",
-            "content": (
-                "Calculate the optimal Nuzlocke strategy for this battle.\n\n"
-                f"Battle data:\n{context}\n\n"
-                "Use the tools to run damage calculations, check speed order, and assess "
-                "type matchups before finalizing the strategy. Output the final strategy as JSON."
-            ),
-        }
-    ]
-
-    strategy_data = None
+    contents = [{
+        "role": "user",
+        "parts": [{"text": f"Calculate the Nuzlocke strategy for this battle:\n\n{context}"}],
+    }]
+    config = types.GenerateContentConfig(tools=TOOLS, system_instruction=SYSTEM_PROMPT)
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+        candidate = response.candidates[0]
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result_str = _run_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_str,
-                    })
-            messages.append({"role": "user", "content": tool_results})
+        model_parts = []
+        fn_calls = []
+        for part in candidate.content.parts:
+            if hasattr(part, "function_call") and part.function_call:
+                fn_calls.append(part)
+                model_parts.append({
+                    "function_call": {"name": part.function_call.name, "args": dict(part.function_call.args)}
+                })
+            elif hasattr(part, "text") and part.text:
+                model_parts.append({"text": part.text})
 
-        elif response.stop_reason == "end_turn":
-            summary = "".join(
-                block.text for block in response.content if hasattr(block, "text")
-            )
-            # Try to extract the JSON strategy from the summary
+        contents.append({"role": "model", "parts": model_parts})
+
+        if not fn_calls:
+            summary = " ".join(p["text"] for p in model_parts if "text" in p)
+            strategy_data = None
             try:
                 start = summary.find("{")
                 end = summary.rfind("}") + 1
                 if start >= 0 and end > start:
                     strategy_data = json.loads(summary[start:end])
             except Exception:
-                strategy_data = None
+                pass
+            return {"success": True, "data": strategy_data, "summary": summary}
 
-            return {
-                "success": True,
-                "data": strategy_data,
-                "summary": summary,
-            }
-        else:
-            return {"success": False, "error": f"Unexpected stop_reason: {response.stop_reason}"}
+        fn_results = []
+        for part in fn_calls:
+            name = part.function_call.name
+            args = dict(part.function_call.args)
+            fn_results.append({
+                "function_response": {"name": name, "response": {"result": _run_tool(name, args)}}
+            })
+
+        contents.append({"role": "user", "parts": fn_results})

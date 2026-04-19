@@ -1,20 +1,18 @@
 """
-Displayer agent — takes the player party, trainer party, and strategy JSON
-and formats it into a rich display structure for the frontend.
+Displayer agent — formats player party, trainer party, and strategy into
+a clean JSON structure for the frontend.
 """
 
 import json
 import os
-import anthropic
+from google import genai
+from google.genai import types
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MODEL = "claude-sonnet-4-6"
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "gemini-2.0-flash"
 
 SYSTEM_PROMPT = """You are the Displayer agent for a Pokémon Nuzlocke assistant.
-Your job is to format battle analysis data into a clean, structured JSON that the frontend
-can render directly.
-
-Given player party data, trainer party data, and a strategy, output this exact JSON structure:
+Format the input data into this exact JSON structure for the frontend. Output ONLY the JSON.
 
 {
   "player": {
@@ -23,16 +21,17 @@ Given player party data, trainer party data, and a strategy, output this exact J
       {
         "nickname": "...",
         "species_name": "...",
-        "level": 0,
+        "species_id": 0,
         "type1": "...",
         "type2": "...",
+        "level": 0,
         "hp_current": 0,
         "hp_max": 0,
         "hp_percent": 0.0,
         "is_fainted": false,
-        "moves": [{"name": "...", "type": "...", "power": 0}],
-        "sprite_url": "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/<dex_id>.png",
-        "strategy_role": "lead | support | closer | bench",
+        "moves": [{"id": 0, "name": "...", "type": "...", "power": 0, "pp": 0}],
+        "sprite_url": "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/<species_id>.png",
+        "strategy_role": "lead|support|closer|bench",
         "risk_note": "..."
       }
     ]
@@ -44,12 +43,13 @@ Given player party data, trainer party data, and a strategy, output this exact J
     "party": [
       {
         "species_name": "...",
-        "level": 0,
+        "species_id": 0,
         "type1": "...",
         "type2": "...",
+        "level": 0,
         "moves": [],
-        "sprite_url": "...",
-        "danger_level": "low | medium | high"
+        "sprite_url": "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/<species_id>.png",
+        "danger_level": "low|medium|high"
       }
     ]
   },
@@ -62,41 +62,23 @@ Given player party data, trainer party data, and a strategy, output this exact J
   }
 }
 
-Use the species_id to build the sprite URL. Always include all fields.
-Set danger_level based on the strategy's danger_pokemon list and matchup risk levels."""
+Build sprite_url using species_id. Set danger_level from the strategy's danger_pokemon list."""
 
 
-def format_for_display(
-    player_data: dict,
-    trainer_data: dict,
-    strategy_data: dict,
-) -> dict:
-    """
-    Returns: { success, data: display dict, error }
-    """
+def format_for_display(player_data: dict, trainer_data: dict, strategy_data: dict) -> dict:
     context = json.dumps({
         "player_data": player_data,
         "trainer_data": trainer_data,
         "strategy_data": strategy_data,
     }, indent=2)
 
-    response = client.messages.create(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": (
-                    "Format this data for frontend display. Output only the JSON object, "
-                    "no other text.\n\n" + context
-                ),
-            }
-        ],
+        contents=[{"role": "user", "parts": [{"text": context}]}],
+        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
     )
 
-    raw = "".join(block.text for block in response.content if hasattr(block, "text"))
-
+    raw = response.text or ""
     try:
         start = raw.find("{")
         end = raw.rfind("}") + 1

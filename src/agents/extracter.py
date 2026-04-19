@@ -1,26 +1,24 @@
 """
 Extracter agent — parses a .sav file and returns the player's party as JSON.
-Wraps sav_parser as a Claude tool so the LLM can call it.
 """
 
 import json
 import os
-import anthropic
-from src.tools.sav_parser import parse_save, PokemonData, SaveData
+from google import genai
+from google.genai import types
+from src.tools.sav_parser import parse_save, PokemonData
 
-client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-MODEL = "claude-sonnet-4-6"
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+MODEL = "gemini-2.0-flash"
 
-# ── Tool definition ────────────────────────────────────────────────────────
-
-TOOLS = [
-    {
+TOOLS = [{
+    "function_declarations": [{
         "name": "parse_sav_file",
         "description": (
             "Parse a Pokémon Emerald .sav file and return the player's party "
             "Pokémon with their levels, moves, types, and stats."
         ),
-        "input_schema": {
+        "parameters": {
             "type": "object",
             "properties": {
                 "sav_hex": {
@@ -30,8 +28,12 @@ TOOLS = [
             },
             "required": ["sav_hex"],
         },
-    }
-]
+    }]
+}]
+
+SYSTEM_PROMPT = """You are the Extracter agent for a Pokémon Nuzlocke assistant.
+Parse the player's save file using the parse_sav_file tool, then summarise each
+Pokémon (name, level, types, moves, HP). Never fabricate party data — always call the tool."""
 
 
 def _pokemon_to_dict(p: PokemonData) -> dict:
@@ -60,12 +62,12 @@ def _pokemon_to_dict(p: PokemonData) -> dict:
     }
 
 
-def _run_tool(tool_name: str, tool_input: dict) -> str:
-    if tool_name == "parse_sav_file":
+def _run_tool(name: str, args: dict) -> str:
+    if name == "parse_sav_file":
         try:
-            sav_bytes = bytes.fromhex(tool_input["sav_hex"])
+            sav_bytes = bytes.fromhex(args["sav_hex"])
             save = parse_save(sav_bytes)
-            result = {
+            return json.dumps({
                 "success": True,
                 "data": {
                     "trainer_name": save.trainer_name,
@@ -73,82 +75,61 @@ def _run_tool(tool_name: str, tool_input: dict) -> str:
                     "trainer_id": save.trainer_id,
                     "party": [_pokemon_to_dict(p) for p in save.party],
                 },
-            }
+            })
         except Exception as e:
-            result = {"success": False, "error": str(e)}
-        return json.dumps(result)
-    return json.dumps({"success": False, "error": f"Unknown tool: {tool_name}"})
-
-
-# ── Agent loop ─────────────────────────────────────────────────────────────
-
-SYSTEM_PROMPT = """You are the Extracter agent for a Pokémon Nuzlocke assistant.
-Your job is to parse the player's save file and return a clean JSON summary of their party.
-Use the parse_sav_file tool. After parsing, return a brief summary of each Pokémon
-(name, level, types, moves, HP) in plain language so the user can verify correctness.
-Always call the tool — never guess or fabricate party data."""
+            return json.dumps({"success": False, "error": str(e)})
+    return json.dumps({"success": False, "error": f"Unknown tool: {name}"})
 
 
 def extract_party(sav_bytes: bytes) -> dict:
-    """
-    Given raw .sav file bytes, returns:
-    { success, data: { trainer_name, trainer_gender, trainer_id, party: [...] }, summary: str }
-    """
     sav_hex = sav_bytes.hex()
-    messages = [
-        {
-            "role": "user",
-            "content": f"Parse this save file and return the player's party. sav_hex length: {len(sav_hex)} chars.",
-        }
-    ]
+    contents = [{
+        "role": "user",
+        "parts": [{"text": f"Parse this save file. Call parse_sav_file with sav_hex={sav_hex!r}"}],
+    }]
+    config = types.GenerateContentConfig(tools=TOOLS, system_instruction=SYSTEM_PROMPT)
 
-    # Inject hex as a tool input context to avoid passing it through the LLM text
-    messages[0]["content"] += (
-        f"\n\nPlease call parse_sav_file with sav_hex={sav_hex!r}"
-    )
+    last_result: dict | None = None
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
+        candidate = response.candidates[0]
 
-        if response.stop_reason == "tool_use":
-            messages.append({"role": "assistant", "content": response.content})
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    result_str = _run_tool(block.name, block.input)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result_str,
-                    })
-            messages.append({"role": "user", "content": tool_results})
+        # Collect model parts for history
+        model_parts = []
+        fn_calls = []
+        for part in candidate.content.parts:
+            if hasattr(part, "function_call") and part.function_call:
+                fn_calls.append(part)
+                model_parts.append({
+                    "function_call": {"name": part.function_call.name, "args": dict(part.function_call.args)}
+                })
+            elif hasattr(part, "text") and part.text:
+                model_parts.append({"text": part.text})
 
-        elif response.stop_reason == "end_turn":
-            summary = "".join(
-                block.text for block in response.content if hasattr(block, "text")
+        contents.append({"role": "model", "parts": model_parts})
+
+        if not fn_calls:
+            summary = " ".join(
+                p["text"] for p in model_parts if "text" in p
             )
-            # Retrieve the parsed data from the last tool result
-            last_result = None
-            for msg in reversed(messages):
-                if isinstance(msg["content"], list):
-                    for item in msg["content"]:
-                        if isinstance(item, dict) and item.get("type") == "tool_result":
-                            last_result = json.loads(item["content"])
-                            break
-                if last_result:
-                    break
-
             return {
-                "success": last_result.get("success", False) if last_result else False,
-                "data": last_result.get("data") if last_result else None,
+                "success": last_result is not None and last_result.get("success", False),
+                "data": last_result["data"] if last_result else None,
                 "summary": summary,
-                "error": last_result.get("error") if last_result else "No tool result found",
+                "error": last_result.get("error") if last_result else "No tool result",
             }
-        else:
-            return {"success": False, "error": f"Unexpected stop_reason: {response.stop_reason}"}
+
+        fn_results = []
+        for part in fn_calls:
+            name = part.function_call.name
+            args = dict(part.function_call.args)
+            result_str = _run_tool(name, args)
+            parsed = json.loads(result_str)
+            if parsed.get("success"):
+                last_result = parsed
+            fn_results.append({
+                "function_response": {"name": name, "response": {"result": result_str}}
+            })
+
+        contents.append({"role": "user", "parts": fn_results})
