@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-pokenavy text-gray-100 font-mono;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-pokenavy;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-pokeborder rounded-full;
+  }
+}
+
+@layer components {
+  .card {
+    @apply bg-pokecard border border-pokeborder rounded-xl p-4;
+  }
+
+  .btn-primary {
+    @apply bg-pokered hover:bg-red-700 text-white font-semibold px-5 py-2.5
+           rounded-lg transition-all duration-200 shadow-glow hover:shadow-none
+           disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .btn-secondary {
+    @apply bg-pokeborder hover:bg-blue-900 text-white font-semibold px-5 py-2.5
+           rounded-lg transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed;
+  }
+
+  .hp-bar-bg {
+    @apply h-2 rounded-full bg-gray-700 overflow-hidden;
+  }
+
+  .risk-safe      { @apply text-green-400; }
+  .risk-caution   { @apply text-yellow-400; }
+  .risk-dangerous { @apply text-red-400; }
+
+  .danger-low    { @apply border-green-600; }
+  .danger-medium { @apply border-yellow-500; }
+  .danger-high   { @apply border-red-500 shadow-glow; }
+}

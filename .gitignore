@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+
+# ROM / Save files — never commit these
+*.gba
+*.sav
+*.nds
+*.sav.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+
+# Cached game data (populated at runtime via populate.py)
+src/data/cache/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
