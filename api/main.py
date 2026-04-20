@@ -1,12 +1,15 @@
 """
-FastAPI backend — orchestrates the four agents for a Nuzlocke battle analysis session.
+FastAPI backend — orchestrates the Nuzlocke battle analysis pipeline.
 
-Flow:
+Upload flow:
   POST /session                   → create session, get session_id
-  POST /session/{id}/upload/sav   → upload .sav → runs extracter agent
-  POST /session/{id}/upload/gba   → upload .gba + optional trainer hint → runs researcher agent
-  POST /session/{id}/analyze      → runs calculator + displayer → returns full display data
-  GET  /session/{id}              → get current session state
+  POST /session/{id}/upload/sav   → parse .sav directly → store player party
+  POST /session/{id}/upload/gba   → parse .gba directly → store trainer data
+  POST /session/{id}/analyze      → run calculator + displayer agents → strategy
+  GET  /session/{id}              → current session state
+
+Binary parsing (sav + gba) is done directly in Python — no LLM involvement.
+The LLM is only used for strategy reasoning and display formatting.
 """
 
 import os
@@ -15,12 +18,13 @@ load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import Optional
 
+from src.tools.sav_parser import parse_save, PokemonData
+from src.tools.gba_parser import (
+    get_trainer_by_index, search_trainers, get_all_trainers, TrainerData,
+)
 from src.core.session_manager import session_manager
-from src.agents.extracter import extract_party
-from src.agents.researcher import research_next_trainer
 from src.agents.calculator import calculate_strategy
 from src.agents.displayer import format_for_display
 
@@ -33,6 +37,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _pokemon_to_dict(p: PokemonData) -> dict:
+    return {
+        "slot": p.slot,
+        "nickname": p.nickname,
+        "species_id": p.species_id,
+        "species_name": p.species_name,
+        "type1": p.type1,
+        "type2": p.type2,
+        "level": p.level,
+        "current_hp": p.current_hp,
+        "max_hp": p.max_hp,
+        "atk": p.atk,
+        "def": p.def_,
+        "spa": p.spa,
+        "spd": p.spd,
+        "spe": p.spe,
+        "moves": p.moves,
+        "held_item_id": p.held_item_id,
+        "experience": p.experience,
+        "friendship": p.friendship,
+        "ivs": p.ivs,
+        "evs": p.evs,
+        "is_fainted": p.is_fainted,
+    }
+
+
+def _trainer_to_dict(t: TrainerData) -> dict:
+    return {
+        "trainer_index": t.trainer_index,
+        "name": t.name,
+        "trainer_class": t.trainer_class,
+        "is_double": t.is_double,
+        "party": [
+            {
+                "species_id": p.species_id,
+                "species_name": p.species_name,
+                "type1": p.type1,
+                "type2": p.type2,
+                "level": p.level,
+                "iv_value": p.iv_value,
+                "held_item_id": p.held_item_id,
+                "moves": p.moves,
+                # Provide stat placeholders so the calculator has something to work with.
+                # Trainer mons don't store live stats in the ROM — use level-scaled estimates.
+                "current_hp": p.level * 2 + 20,
+                "max_hp":     p.level * 2 + 20,
+                "atk": max(10, p.level + p.iv_value),
+                "def": max(10, p.level + p.iv_value),
+                "spa": max(10, p.level + p.iv_value),
+                "spd": max(10, p.level + p.iv_value),
+                "spe": max(10, p.level + p.iv_value),
+            }
+            for p in t.party
+        ],
+    }
 
 
 # ── Session ────────────────────────────────────────────────────────────────
@@ -59,7 +122,7 @@ def get_session(session_id: str):
     }
 
 
-# ── File uploads ───────────────────────────────────────────────────────────
+# ── File uploads (binary parsing — no LLM) ────────────────────────────────
 
 @app.post("/session/{session_id}/upload/sav")
 async def upload_sav(session_id: str, file: UploadFile = File(...)):
@@ -71,18 +134,21 @@ async def upload_sav(session_id: str, file: UploadFile = File(...)):
     if len(sav_bytes) < 0x1000:
         raise HTTPException(status_code=400, detail="File too small to be a valid .sav")
 
-    result = extract_party(sav_bytes)
-    if not result["success"]:
-        raise HTTPException(status_code=422, detail=result.get("error", "Failed to parse .sav"))
+    try:
+        save = parse_save(sav_bytes)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to parse .sav: {e}")
 
-    session.player_data = result["data"]
+    player_data = {
+        "trainer_name": save.trainer_name,
+        "trainer_gender": save.trainer_gender,
+        "trainer_id": save.trainer_id,
+        "party": [_pokemon_to_dict(p) for p in save.party],
+    }
+    session.player_data = player_data
     session_manager.update(session)
 
-    return {
-        "success": True,
-        "player_data": result["data"],
-        "summary": result["summary"],
-    }
+    return {"success": True, "player_data": player_data}
 
 
 @app.post("/session/{session_id}/upload/gba")
@@ -99,29 +165,38 @@ async def upload_gba(
     if len(rom_bytes) < 0x100000:
         raise HTTPException(status_code=400, detail="File too small to be a valid .gba ROM")
 
-    # Parse trainer_hint — could be a name or an integer index
-    hint: str | int | None = None
-    if trainer_hint:
-        try:
-            hint = int(trainer_hint)
-        except ValueError:
-            hint = trainer_hint
+    try:
+        trainer: TrainerData | None = None
 
-    result = research_next_trainer(rom_bytes, trainer_hint=hint)
-    if not result["success"]:
-        raise HTTPException(status_code=422, detail=result.get("error", "Failed to find trainer"))
+        if trainer_hint:
+            trainer_hint = trainer_hint.strip()
+            try:
+                idx = int(trainer_hint)
+                trainer = get_trainer_by_index(rom_bytes, idx)
+            except ValueError:
+                results = search_trainers(rom_bytes, trainer_hint)
+                trainer = results[0] if results else None
 
-    session.trainer_data = result["data"]
+        if trainer is None:
+            all_trainers = get_all_trainers(rom_bytes)
+            trainer = all_trainers[0] if all_trainers else None
+
+        if trainer is None:
+            raise HTTPException(status_code=422, detail="No valid trainer found in ROM")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Failed to parse .gba: {e}")
+
+    trainer_data = _trainer_to_dict(trainer)
+    session.trainer_data = trainer_data
     session_manager.update(session)
 
-    return {
-        "success": True,
-        "trainer_data": result["data"],
-        "summary": result["summary"],
-    }
+    return {"success": True, "trainer_data": trainer_data}
 
 
-# ── Analysis ───────────────────────────────────────────────────────────────
+# ── Analysis (LLM agents) ──────────────────────────────────────────────────
 
 @app.post("/session/{session_id}/analyze")
 def analyze(session_id: str):
@@ -134,32 +209,27 @@ def analyze(session_id: str):
             detail="Upload both .sav and .gba files before analyzing",
         )
 
-    # Step 1: Calculate strategy
-    calc_result = calculate_strategy(
+    calc = calculate_strategy(
         player_party=session.player_data["party"],
         trainer_party=session.trainer_data["party"],
     )
-    if not calc_result["success"]:
+    if not calc["success"]:
         raise HTTPException(status_code=500, detail="Strategy calculation failed")
 
-    session.strategy_data = calc_result["data"]
+    session.strategy_data = calc["data"]
 
-    # Step 2: Format for display
-    display_result = format_for_display(
+    display = format_for_display(
         player_data=session.player_data,
         trainer_data=session.trainer_data,
-        strategy_data=calc_result["data"] or {},
+        strategy_data=calc["data"] or {},
     )
-    if not display_result["success"]:
-        raise HTTPException(status_code=500, detail="Display formatting failed")
+    if not display["success"]:
+        raise HTTPException(status_code=500, detail=f"Display formatting failed: {display.get('error')}")
 
-    session.display_data = display_result["data"]
+    session.display_data = display["data"]
     session_manager.update(session)
 
-    return {
-        "success": True,
-        "display_data": session.display_data,
-    }
+    return {"success": True, "display_data": session.display_data}
 
 
 # ── Health ─────────────────────────────────────────────────────────────────

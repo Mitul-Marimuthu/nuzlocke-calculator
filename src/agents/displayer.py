@@ -4,15 +4,10 @@ a clean JSON structure for the frontend.
 """
 
 import json
-import os
-from google import genai
-from google.genai import types
-
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = "gemini-2.0-flash"
+from src.agents._client import chat
 
 SYSTEM_PROMPT = """You are the Displayer agent for a Pokémon Nuzlocke assistant.
-Format the input data into this exact JSON structure for the frontend. Output ONLY the JSON.
+Format the input data into this exact JSON structure. Output ONLY the JSON — no markdown, no extra text.
 
 {
   "player": {
@@ -23,13 +18,13 @@ Format the input data into this exact JSON structure for the frontend. Output ON
         "species_name": "...",
         "species_id": 0,
         "type1": "...",
-        "type2": "...",
+        "type2": null,
         "level": 0,
         "hp_current": 0,
         "hp_max": 0,
         "hp_percent": 0.0,
         "is_fainted": false,
-        "moves": [{"id": 0, "name": "...", "type": "...", "power": 0, "pp": 0}],
+        "moves": [{"id": 0, "name": "...", "type": "...", "power": null, "pp": 0}],
         "sprite_url": "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/<species_id>.png",
         "strategy_role": "lead|support|closer|bench",
         "risk_note": "..."
@@ -45,7 +40,7 @@ Format the input data into this exact JSON structure for the frontend. Output ON
         "species_name": "...",
         "species_id": 0,
         "type1": "...",
-        "type2": "...",
+        "type2": null,
         "level": 0,
         "moves": [],
         "sprite_url": "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/<species_id>.png",
@@ -62,7 +57,10 @@ Format the input data into this exact JSON structure for the frontend. Output ON
   }
 }
 
-Build sprite_url using species_id. Set danger_level from the strategy's danger_pokemon list."""
+Rules:
+- Build sprite_url from species_id.
+- Set danger_level using the strategy danger_pokemon list and matchup risk_levels.
+- Set strategy_role: lead = recommended lead, bench = fainted or not needed, closer = saved for last, support = utility."""
 
 
 def format_for_display(player_data: dict, trainer_data: dict, strategy_data: dict) -> dict:
@@ -72,13 +70,12 @@ def format_for_display(player_data: dict, trainer_data: dict, strategy_data: dic
         "strategy_data": strategy_data,
     }, indent=2)
 
-    response = client.models.generate_content(
-        model=MODEL,
-        contents=[{"role": "user", "parts": [{"text": context}]}],
-        config=types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT),
-    )
+    response = chat(messages=[
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": context},
+    ])
 
-    raw = response.text or ""
+    raw = response.choices[0].message.content or ""
     try:
         start = raw.find("{")
         end = raw.rfind("}") + 1

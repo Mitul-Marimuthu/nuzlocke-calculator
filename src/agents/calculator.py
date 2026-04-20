@@ -4,31 +4,30 @@ no-item Nuzlocke battle strategy.
 """
 
 import json
-import os
-from google import genai
-from google.genai import types
+from src.agents._client import chat
 from src.tools.damage_calc import best_move_against, estimate_turns_to_ko, speed_order, type_weaknesses
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-MODEL = "gemini-2.0-flash"
-
-TOOLS = [{
-    "function_declarations": [
-        {
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
             "name": "calc_damage",
-            "description": "Calculate min/max/avg damage for each of the attacker's moves against the defender.",
+            "description": "Calculate min/max/avg damage for each of the attacker's moves against the defender. Returns moves sorted by average damage.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "attacker": {"type": "object", "description": "Attacker dict: level, atk, spa, type1, type2, moves"},
-                    "defender": {"type": "object", "description": "Defender dict: current_hp, def, spd, type1, type2"},
+                    "attacker": {"type": "object", "description": "Attacker dict with level, atk, spa, type1, type2, moves"},
+                    "defender": {"type": "object", "description": "Defender dict with current_hp, def, spd, type1, type2"},
                 },
                 "required": ["attacker", "defender"],
             },
         },
-        {
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calc_speed_order",
-            "description": "Determine which Pokémon attacks first.",
+            "description": "Determine which Pokémon attacks first based on Speed stat.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -38,9 +37,12 @@ TOOLS = [{
                 "required": ["pokemon_a", "pokemon_b"],
             },
         },
-        {
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calc_turns_to_ko",
-            "description": "Estimate turns each side needs to KO the other.",
+            "description": "Estimate turns each side needs to KO the other using their best move.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -50,9 +52,12 @@ TOOLS = [{
                 "required": ["attacker", "defender"],
             },
         },
-        {
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_type_weaknesses",
-            "description": "Get all type effectiveness values for a Pokémon's type combo.",
+            "description": "Get all non-neutral type effectiveness values against a Pokémon's type combo.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -62,8 +67,8 @@ TOOLS = [{
                 "required": ["type1"],
             },
         },
-    ]
-}]
+    },
+]
 
 SYSTEM_PROMPT = """You are the Calculator agent for a Pokémon Nuzlocke assistant.
 Produce the optimal battle strategy to defeat the next trainer without losing any Pokémon.
@@ -72,21 +77,21 @@ Rules:
 1. Never recommend items (Potions, X-items). Held items are fine.
 2. Prioritise Pokémon survival above all else.
 3. Use calc_speed_order to know who moves first.
-4. Use worst-case damage (min player damage, max opponent damage).
+4. Plan around worst-case damage (min player damage, max opponent damage).
 5. Recommend switching if a matchup is dangerous.
-6. Account for low-HP Pokémon.
+6. Account for Pokémon already at low HP.
 
-Use the tools to run calculations, then output ONLY this JSON:
+Use the tools to run calculations, then output ONLY this JSON (no other text):
 {
-  "lead_recommendation": "<species_name>",
+  "lead_recommendation": "<species or nickname>",
   "lead_reasoning": "<why>",
   "matchups": [
     {
       "player_pokemon": "<name>",
       "opponent_pokemon": "<name>",
-      "recommended_move": "<move>",
+      "recommended_move": "<move name>",
       "risk_level": "safe|caution|dangerous",
-      "notes": "<e.g. switch if below X HP>"
+      "notes": "<e.g. switch out if below X HP>"
     }
   ],
   "overall_notes": "<general advice>",
@@ -112,31 +117,23 @@ def _run_tool(name: str, args: dict) -> str:
 def calculate_strategy(player_party: list[dict], trainer_party: list[dict]) -> dict:
     context = json.dumps({"player_party": player_party, "opponent_party": trainer_party}, indent=2)
 
-    contents = [{
-        "role": "user",
-        "parts": [{"text": f"Calculate the Nuzlocke strategy for this battle:\n\n{context}"}],
-    }]
-    config = types.GenerateContentConfig(tools=TOOLS, system_instruction=SYSTEM_PROMPT)
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": f"Calculate the Nuzlocke strategy:\n\n{context}"},
+    ]
 
     while True:
-        response = client.models.generate_content(model=MODEL, contents=contents, config=config)
-        candidate = response.candidates[0]
+        response = chat(messages, tools=TOOLS)
+        msg = response.choices[0].message
 
-        model_parts = []
-        fn_calls = []
-        for part in candidate.content.parts:
-            if hasattr(part, "function_call") and part.function_call:
-                fn_calls.append(part)
-                model_parts.append({
-                    "function_call": {"name": part.function_call.name, "args": dict(part.function_call.args)}
-                })
-            elif hasattr(part, "text") and part.text:
-                model_parts.append({"text": part.text})
-
-        contents.append({"role": "model", "parts": model_parts})
-
-        if not fn_calls:
-            summary = " ".join(p["text"] for p in model_parts if "text" in p)
+        if msg.tool_calls:
+            messages.append(msg)
+            for tc in msg.tool_calls:
+                args = json.loads(tc.function.arguments)
+                result = _run_tool(tc.function.name, args)
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+        else:
+            summary = msg.content or ""
             strategy_data = None
             try:
                 start = summary.find("{")
@@ -146,13 +143,3 @@ def calculate_strategy(player_party: list[dict], trainer_party: list[dict]) -> d
             except Exception:
                 pass
             return {"success": True, "data": strategy_data, "summary": summary}
-
-        fn_results = []
-        for part in fn_calls:
-            name = part.function_call.name
-            args = dict(part.function_call.args)
-            fn_results.append({
-                "function_response": {"name": name, "response": {"result": _run_tool(name, args)}}
-            })
-
-        contents.append({"role": "user", "parts": fn_results})

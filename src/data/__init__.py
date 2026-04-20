@@ -22,8 +22,14 @@ def load_moves() -> dict:
 
 
 def get_species(dex_id: int) -> dict | None:
-    return load_species().get(str(dex_id))
+    try:
+        return load_species().get(str(dex_id))
+    except FileNotFoundError:
+        return None
 
 
 def get_move(move_id: int) -> dict | None:
-    return load_moves().get(str(move_id))
+    try:
+        return load_moves().get(str(move_id))
+    except FileNotFoundError:
+        return None
