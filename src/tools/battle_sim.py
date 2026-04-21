@@ -1,16 +1,24 @@
 """
-Turn-by-turn Gen 3 battle simulator.
-Simulates each turn deterministically using damage calc, then returns a full
-turn log that the calculator agent annotates.
+Turn-by-turn Gen 3 battle simulator — Nuzlocke-safe mode.
+
+Lead and switch selection prioritises survival (fewest faints) over raw damage.
+Scoring: projected HP remaining after KO-ing opponent, penalised heavily if
+worst-case damage would KO the player first.  Only fall back to raw damage as
+a tiebreaker.
+
+Proactive switching: after every individual turn, if player HP drops below
+HP_SWITCH_THRESHOLD *and* a safer teammate would take less cumulative damage
+finishing this opponent, we switch immediately.
 """
 
 import copy
 import math
 from dataclasses import dataclass
 from src.tools.damage_calc import calc_damage, best_move_against, speed_order
-from src.data.type_chart import get_effectiveness
 
-# Generic move power when a trainer Pokémon has no recorded moveset
+# Fraction of max HP below which we evaluate a proactive switch
+HP_SWITCH_THRESHOLD = 0.35
+
 _TYPE_MOVE: dict[str, tuple[str, int]] = {
     "Normal":   ("Tackle",           40),
     "Fire":     ("Ember",            40),
@@ -47,9 +55,9 @@ class SimTurn:
     opponent_hp_before: int
     opponent_hp_max: int
 
-    goes_first: str          # "player" | "opponent" | "tie"
+    goes_first: str
 
-    player_action: str       # move name
+    player_action: str
     player_action_type: str
     player_damage_min: int
     player_damage_max: int
@@ -68,8 +76,10 @@ class SimTurn:
 
     player_fainted: bool
     opponent_fainted: bool
-    is_risky: bool           # opponent worst-case damage > 50 % of player max HP
+    is_risky: bool
 
+
+# ── Move helpers ───────────────────────────────────────────────────────────
 
 def _make_generic_move(opponent: dict) -> dict:
     type1 = opponent.get("type1", "Normal")
@@ -79,7 +89,6 @@ def _make_generic_move(opponent: dict) -> dict:
 
 
 def _opponent_move(opponent: dict, player: dict) -> dict:
-    """Return the opponent's best recorded move, or a synthesised generic one."""
     moves = [m for m in opponent.get("moves", []) if m.get("power")]
     if moves:
         scored = best_move_against(opponent, player)
@@ -107,145 +116,174 @@ def _player_best_move(player: dict, opponent: dict) -> dict | None:
     return scored[0] if scored else None
 
 
-def _simulate_matchup(
-    player: dict,
-    opponent: dict,
-    turn_offset: int,
-) -> tuple[list[SimTurn], dict, dict]:
+# ── Survival scoring ───────────────────────────────────────────────────────
+
+def _turns_to_finish(attacker_avg: float, target_hp: int) -> int:
+    if attacker_avg <= 0:
+        return 999
+    return math.ceil(target_hp / attacker_avg)
+
+
+def _survival_score(player: dict, opponent: dict) -> tuple[float, float]:
     """
-    Simulate one player Pokémon vs one opponent Pokémon.
-    Returns (turns, player_state_after, opponent_state_after).
-    Both dicts are mutated copies with updated current_hp.
+    Nuzlocke survival score for player vs opponent.
+
+    Returns (projected_hp_ratio_after_ko, avg_damage_output).
+    - Positive ratio  → player survives the matchup with that fraction of max HP left.
+    - Negative ratio  → player would faint in worst case before finishing the opponent.
+    Higher is always better; tiebreak by damage output.
     """
-    p = copy.deepcopy(player)
-    o = copy.deepcopy(opponent)
-    turns: list[SimTurn] = []
-    matchup_label = f"{p.get('nickname') or p['species_name']} vs {o['species_name']}"
+    scored = best_move_against(player, opponent)
+    p_avg = scored[0]["avg"] if scored else 0
 
-    for t in range(1, _MAX_TURNS_PER_MATCHUP + 1):
-        p_hp_before = p["current_hp"]
-        o_hp_before = o["current_hp"]
+    o_move = _opponent_move(opponent, player)
+    o_max  = o_move["max"]
 
-        # Determine actions
-        p_move_data = _player_best_move(p, o)
-        o_move_data = _opponent_move(o, p)
+    opp_hp = opponent.get("current_hp", opponent.get("max_hp", 100))
+    p_hp   = player["current_hp"]
+    p_max  = player["max_hp"]
 
-        if p_move_data is None:
-            break
+    turns = _turns_to_finish(p_avg, opp_hp)
+    hp_after = p_hp - turns * o_max      # worst-case
+    return (hp_after / p_max, p_avg)
 
-        # Speed order
-        first = speed_order(p, o)   # "a" = player, "b" = opponent, "tie"
-        goes_first = "player" if first == "a" else ("tie" if first == "tie" else "opponent")
 
-        # Apply damage in speed order
-        p_hp_after = p_hp_before
-        o_hp_after = o_hp_before
-
-        def apply_p_move():
-            nonlocal o_hp_after
-            o_hp_after = max(0, o_hp_after - p_move_data["avg"])
-
-        def apply_o_move():
-            nonlocal p_hp_after
-            p_hp_after = max(0, p_hp_after - o_move_data["avg"])
-
-        if goes_first in ("player", "tie"):
-            apply_p_move()
-            if o_hp_after > 0:
-                apply_o_move()
-        else:
-            apply_o_move()
-            if p_hp_after > 0:
-                apply_p_move()
-
-        p["current_hp"] = p_hp_after
-        o["current_hp"] = o_hp_after
-
-        is_risky = o_move_data["max"] >= (p["max_hp"] * 0.5)
-
-        turns.append(SimTurn(
-            turn=turn_offset + t,
-            matchup=matchup_label,
-            player_pokemon=p.get("nickname") or p["species_name"],
-            player_pokemon_species=p["species_name"],
-            player_hp_before=p_hp_before,
-            player_hp_max=p["max_hp"],
-            opponent_pokemon=o["species_name"],
-            opponent_hp_before=o_hp_before,
-            opponent_hp_max=o["max_hp"],
-            goes_first=goes_first,
-            player_action=p_move_data["name"],
-            player_action_type=p_move_data["type"],
-            player_damage_min=p_move_data["min"],
-            player_damage_max=p_move_data["max"],
-            player_damage_avg=p_move_data["avg"],
-            player_effectiveness=p_move_data["effectiveness"],
-            opponent_action=o_move_data["name"],
-            opponent_action_type=o_move_data["type"],
-            opponent_damage_min=o_move_data["min"],
-            opponent_damage_max=o_move_data["max"],
-            opponent_damage_avg=o_move_data["avg"],
-            opponent_effectiveness=o_move_data.get("effectiveness", 1.0),
-            player_hp_after=p_hp_after,
-            opponent_hp_after=o_hp_after,
-            player_fainted=(p_hp_after == 0),
-            opponent_fainted=(o_hp_after == 0),
-            is_risky=is_risky,
-        ))
-
-        if p_hp_after == 0 or o_hp_after == 0:
-            break
-
-    return turns, p, o
-
+# ── Lead / switch selection ────────────────────────────────────────────────
 
 def _pick_lead(player_party: list[dict], first_opponent: dict) -> dict:
-    """Pick the player Pokémon with the best average damage against the first opponent."""
-    best = None
-    best_score = -1
-    for p in player_party:
-        if p.get("is_fainted") or p["current_hp"] <= 0:
-            continue
-        scored = best_move_against(p, first_opponent)
-        score = scored[0]["avg"] if scored else 0
-        if score > best_score:
-            best_score = score
-            best = p
-    return best or player_party[0]
+    alive = [p for p in player_party if not p.get("is_fainted") and p["current_hp"] > 0]
+    if not alive:
+        return player_party[0]
+    return max(alive, key=lambda p: _survival_score(p, first_opponent))
 
 
-def _pick_best_switch(
+def _best_survivor(
     player_party: list[dict],
-    current_player: dict,
+    exclude_species: str,
     opponent: dict,
 ) -> dict | None:
-    """Find the best available player Pokémon (not fainted, not current) for this opponent."""
-    best = None
-    best_score = -1
-    for p in player_party:
-        if p["species_name"] == current_player["species_name"]:
-            continue
-        if p.get("is_fainted") or p["current_hp"] <= 0:
-            continue
-        scored = best_move_against(p, opponent)
-        score = scored[0]["avg"] if scored else 0
-        if score > best_score:
-            best_score = score
-            best = p
-    return best
+    """Return the alive Pokémon (excluding current) with the highest survival score."""
+    candidates = [
+        p for p in player_party
+        if p["species_name"] != exclude_species
+        and not p.get("is_fainted")
+        and p["current_hp"] > 0
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: _survival_score(p, opponent))
 
+
+def _should_switch(current: dict, candidate: dict, opponent: dict, emergency: bool = False) -> bool:
+    """
+    True if switching to candidate is the safer Nuzlocke play.
+
+    emergency=False (pre-battle): only switch if meaningfully better (> 10 % HP margin).
+    emergency=True  (HP critical): switch to the least-bad option — any improvement counts,
+                                   because burning a low-HP Pokémon further is always worse.
+    """
+    cur_ratio,  _ = _survival_score(current,   opponent)
+    best_ratio, _ = _survival_score(candidate, opponent)
+    # Always switch if candidate survives cleanly and current would not
+    if cur_ratio < 0 and best_ratio >= 0:
+        return True
+    if emergency:
+        return best_ratio > cur_ratio          # any improvement
+    return best_ratio > cur_ratio + 0.10       # pre-battle: require clear margin
+
+
+# ── Single-turn simulation ─────────────────────────────────────────────────
+
+def _sim_one_turn(
+    player: dict,
+    opponent: dict,
+    global_turn: int,
+    matchup_label: str,
+) -> tuple[SimTurn, int, int]:
+    """
+    Simulate exactly one turn.  Returns (SimTurn, player_hp_after, opp_hp_after).
+    Caller is responsible for writing hp values back into their dicts.
+    """
+    p_move = _player_best_move(player, opponent)
+    o_move = _opponent_move(opponent, player)
+
+    if p_move is None:
+        # No usable move — treat as struggle (tiny fixed damage)
+        p_move = {"name": "Struggle", "type": "Normal", "power": 50,
+                  "min": 5, "max": 10, "avg": 7, "effectiveness": 1.0,
+                  "damage_class": "physical"}
+
+    first = speed_order(player, opponent)
+    goes_first = "player" if first == "a" else ("tie" if first == "tie" else "opponent")
+
+    p_hp_before = player["current_hp"]
+    o_hp_before = opponent["current_hp"]
+    p_hp_after  = p_hp_before
+    o_hp_after  = o_hp_before
+
+    def apply_p():
+        nonlocal o_hp_after
+        o_hp_after = max(0, o_hp_after - p_move["avg"])
+
+    def apply_o():
+        nonlocal p_hp_after
+        p_hp_after = max(0, p_hp_after - o_move["avg"])
+
+    if goes_first in ("player", "tie"):
+        apply_p()
+        if o_hp_after > 0:
+            apply_o()
+    else:
+        apply_o()
+        if p_hp_after > 0:
+            apply_p()
+
+    is_risky = o_move["max"] >= player["max_hp"] * 0.4
+
+    t = SimTurn(
+        turn=global_turn,
+        matchup=matchup_label,
+        player_pokemon=player.get("nickname") or player["species_name"],
+        player_pokemon_species=player["species_name"],
+        player_hp_before=p_hp_before,
+        player_hp_max=player["max_hp"],
+        opponent_pokemon=opponent.get("nickname") or opponent["species_name"],
+        opponent_hp_before=o_hp_before,
+        opponent_hp_max=opponent["max_hp"],
+        goes_first=goes_first,
+        player_action=p_move["name"],
+        player_action_type=p_move["type"],
+        player_damage_min=p_move["min"],
+        player_damage_max=p_move["max"],
+        player_damage_avg=p_move["avg"],
+        player_effectiveness=p_move["effectiveness"],
+        opponent_action=o_move["name"],
+        opponent_action_type=o_move["type"],
+        opponent_damage_min=o_move["min"],
+        opponent_damage_max=o_move["max"],
+        opponent_damage_avg=o_move["avg"],
+        opponent_effectiveness=o_move.get("effectiveness", 1.0),
+        player_hp_after=p_hp_after,
+        opponent_hp_after=o_hp_after,
+        player_fainted=(p_hp_after == 0),
+        opponent_fainted=(o_hp_after == 0),
+        is_risky=is_risky,
+    )
+    return t, p_hp_after, o_hp_after
+
+
+# ── Full battle ────────────────────────────────────────────────────────────
 
 def simulate_battle(player_party: list[dict], trainer_party: list[dict]) -> dict:
     """
-    Full battle simulation.
-    Returns a dict with:
-      lead_recommendation, all_turns (list of SimTurn dicts),
-      matchup_summary (per opponent Pokémon), surviving_party
+    Full Nuzlocke-safe battle simulation.
+
+    Runs one turn at a time so proactive switching can fire after every turn.
+    Lead and switch decisions minimise faints rather than maximise damage.
     """
-    players = copy.deepcopy(player_party)
+    players   = copy.deepcopy(player_party)
     opponents = copy.deepcopy(trainer_party)
 
-    # Ensure all have current_hp
     for p in players:
         if "current_hp" not in p:
             p["current_hp"] = p.get("max_hp", p["level"] * 2 + 20)
@@ -258,99 +296,109 @@ def simulate_battle(player_party: list[dict], trainer_party: list[dict]) -> dict
             o["max_hp"] = o["current_hp"]
 
     lead = _pick_lead(players, opponents[0])
-    # Sync lead back into players list
     for i, p in enumerate(players):
         if p["species_name"] == lead["species_name"]:
             players[i] = lead
             break
 
-    all_turns: list[dict] = []
+    all_turns:         list[dict] = []
     matchup_summaries: list[dict] = []
     current_player = lead
-    turn_counter = 0
+    global_turn    = 0
 
     for opp in opponents:
-        opp_turns: list[SimTurn] = []
+        opp_turn_count = 0
+        opp_risky      = 0
 
-        # Check if we need a better matchup switch before starting
-        switch_target = _pick_best_switch(players, current_player, opp)
-        if switch_target:
-            # Compare: would switching give significantly better damage?
-            cur_scored = best_move_against(current_player, opp)
-            sw_scored  = best_move_against(switch_target, opp)
-            cur_avg = cur_scored[0]["avg"] if cur_scored else 0
-            sw_avg  = sw_scored[0]["avg"]  if sw_scored  else 0
-            if sw_avg > cur_avg * 1.5:
-                current_player = switch_target
+        # Pre-battle: switch to a safer lead if one exists
+        candidate = _best_survivor(players, current_player["species_name"], opp)
+        if candidate and _should_switch(current_player, candidate, opp):
+            current_player = candidate
 
-        while opp["current_hp"] > 0:
-            # If current player fainted, find next available
+        matchup_label = f"{current_player.get('nickname') or current_player['species_name']} vs {opp['species_name']}"
+
+        for _ in range(_MAX_TURNS_PER_MATCHUP * len(players)):
+            # Force-switch if fainted
             if current_player["current_hp"] <= 0:
-                nxt = _pick_best_switch(players, current_player, opp)
+                nxt = _best_survivor(players, current_player["species_name"], opp)
                 if nxt is None:
                     break
                 current_player = nxt
+                matchup_label = f"{current_player.get('nickname') or current_player['species_name']} vs {opp['species_name']}"
 
-            turns, p_after, o_after = _simulate_matchup(
-                current_player, opp, turn_counter
+            if opp["current_hp"] <= 0:
+                break
+
+            # Proactive switch: HP critically low — use least-bad available option
+            hp_ratio = current_player["current_hp"] / current_player["max_hp"]
+            if hp_ratio < HP_SWITCH_THRESHOLD:
+                candidate = _best_survivor(players, current_player["species_name"], opp)
+                if candidate and _should_switch(current_player, candidate, opp, emergency=True):
+                    current_player = candidate
+                    matchup_label = f"{current_player.get('nickname') or current_player['species_name']} vs {opp['species_name']}"
+
+            global_turn += 1
+            opp_turn_count += 1
+
+            turn, p_hp, o_hp = _sim_one_turn(
+                current_player, opp, global_turn, matchup_label
             )
-            opp_turns.extend(turns)
-            turn_counter += len(turns)
 
-            # Update states
+            # Write HP back
+            current_player["current_hp"] = p_hp
+            opp["current_hp"] = o_hp
             for i, p in enumerate(players):
-                if p["species_name"] == p_after["species_name"]:
-                    players[i] = p_after
-                    current_player = p_after
+                if p["species_name"] == current_player["species_name"]:
+                    players[i] = current_player
                     break
-            opp["current_hp"] = o_after["current_hp"]
 
-            # Safety: if player fainted during this matchup and opp still alive, switch
-            if p_after["current_hp"] <= 0 and opp["current_hp"] > 0:
-                nxt = _pick_best_switch(players, p_after, opp)
-                if nxt is None:
-                    break
-                current_player = nxt
+            if turn.is_risky:
+                opp_risky += 1
 
-        risky_turns = sum(1 for t in opp_turns if t.is_risky)
-        risk_level = "dangerous" if risky_turns >= 2 else ("caution" if risky_turns == 1 else "safe")
+            all_turns.append({
+                "turn": turn.turn,
+                "matchup": turn.matchup,
+                "player_pokemon": turn.player_pokemon,
+                "player_pokemon_species": turn.player_pokemon_species,
+                "player_hp_before": turn.player_hp_before,
+                "player_hp_max": turn.player_hp_max,
+                "opponent_pokemon": turn.opponent_pokemon,
+                "opponent_hp_before": turn.opponent_hp_before,
+                "opponent_hp_max": turn.opponent_hp_max,
+                "goes_first": turn.goes_first,
+                "player_action": turn.player_action,
+                "player_action_type": turn.player_action_type,
+                "player_damage_min": turn.player_damage_min,
+                "player_damage_max": turn.player_damage_max,
+                "player_damage_avg": turn.player_damage_avg,
+                "player_effectiveness": turn.player_effectiveness,
+                "opponent_action": turn.opponent_action,
+                "opponent_action_type": turn.opponent_action_type,
+                "opponent_damage_min": turn.opponent_damage_min,
+                "opponent_damage_max": turn.opponent_damage_max,
+                "opponent_damage_avg": turn.opponent_damage_avg,
+                "opponent_effectiveness": turn.opponent_effectiveness,
+                "player_hp_after": turn.player_hp_after,
+                "opponent_hp_after": turn.opponent_hp_after,
+                "player_fainted": turn.player_fainted,
+                "opponent_fainted": turn.opponent_fainted,
+                "is_risky": turn.is_risky,
+            })
 
+            if o_hp <= 0:
+                break
+
+        risk_level = "dangerous" if opp_risky >= 2 else ("caution" if opp_risky == 1 else "safe")
         matchup_summaries.append({
             "opponent_pokemon": opp["species_name"],
-            "player_pokemon_used": (opp_turns[0].player_pokemon if opp_turns else current_player.get("nickname") or current_player["species_name"]),
-            "turns_to_ko": len(opp_turns),
+            "player_pokemon_used": (
+                all_turns[-opp_turn_count]["player_pokemon"]
+                if opp_turn_count > 0 and opp_turn_count <= len(all_turns)
+                else current_player.get("nickname") or current_player["species_name"]
+            ),
+            "turns_to_ko": opp_turn_count,
             "risk_level": risk_level,
         })
-
-        all_turns.extend([{
-            "turn": t.turn,
-            "matchup": t.matchup,
-            "player_pokemon": t.player_pokemon,
-            "player_pokemon_species": t.player_pokemon_species,
-            "player_hp_before": t.player_hp_before,
-            "player_hp_max": t.player_hp_max,
-            "opponent_pokemon": t.opponent_pokemon,
-            "opponent_hp_before": t.opponent_hp_before,
-            "opponent_hp_max": t.opponent_hp_max,
-            "goes_first": t.goes_first,
-            "player_action": t.player_action,
-            "player_action_type": t.player_action_type,
-            "player_damage_min": t.player_damage_min,
-            "player_damage_max": t.player_damage_max,
-            "player_damage_avg": t.player_damage_avg,
-            "player_effectiveness": t.player_effectiveness,
-            "opponent_action": t.opponent_action,
-            "opponent_action_type": t.opponent_action_type,
-            "opponent_damage_min": t.opponent_damage_min,
-            "opponent_damage_max": t.opponent_damage_max,
-            "opponent_damage_avg": t.opponent_damage_avg,
-            "opponent_effectiveness": t.opponent_effectiveness,
-            "player_hp_after": t.player_hp_after,
-            "opponent_hp_after": t.opponent_hp_after,
-            "player_fainted": t.player_fainted,
-            "opponent_fainted": t.opponent_fainted,
-            "is_risky": t.is_risky,
-        } for t in opp_turns])
 
     lead_name = lead.get("nickname") or lead["species_name"]
     surviving = [p for p in players if p["current_hp"] > 0]
@@ -359,6 +407,6 @@ def simulate_battle(player_party: list[dict], trainer_party: list[dict]) -> dict
         "lead_recommendation": lead_name,
         "turns": all_turns,
         "matchup_summary": matchup_summaries,
-        "surviving_party": [p["species_name"] for p in surviving],
-        "total_turns": turn_counter,
+        "surviving_party": [p.get("nickname") or p["species_name"] for p in surviving],
+        "total_turns": global_turn,
     }
