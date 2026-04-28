@@ -15,7 +15,7 @@ def get_client() -> Groq:
         _client = Groq(api_key=os.environ["GROQ_API_KEY"])
     return _client
 
-
+# chat with the Groq client, with exponential backoff on rate limits
 def chat(messages: list, tools: list | None = None, max_retries: int = 4):
     """Call chat.completions.create with exponential backoff on rate limits."""
     client = get_client()
