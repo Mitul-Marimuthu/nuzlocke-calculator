@@ -7,7 +7,7 @@ from groq import Groq, RateLimitError
 MODEL = "llama-3.3-70b-versatile"
 
 _client: Groq | None = None
-
+# another dummy comment
 
 def get_client() -> Groq:
     global _client
